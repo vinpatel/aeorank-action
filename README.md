@@ -24,6 +24,9 @@ Scan any URL for AI Engine Optimization (AEO) score and post results as a GitHub
 | `url` | URL to scan | Yes | — |
 | `token` | GitHub token for API calls | No | `${{ github.token }}` |
 | `fail-below` | Fail the Check if AEO score drops below this value (0 = never fail) | No | `0` |
+| `fail-on-crawler-block` | Fail the PR if GPTBot is blocked. Check fails when GPTBot, ClaudeBot, PerplexityBot, or Google-Extended is disallowed in robots.txt. Missing robots.txt is **unknown**, not blocked. | No | `true` |
+
+Public crawler statuses in `crawlerAccess` and in the Check table are **`allow`**, **`block`**, and **`unknown`**.
 
 ---
 
@@ -76,9 +79,48 @@ jobs:
           url: https://example.com
           token: ${{ secrets.GITHUB_TOKEN }}
           fail-below: 70
+          fail-on-crawler-block: true
 ```
 
 Replace `https://example.com` with the URL you want to scan on every push or pull request.
+
+---
+
+## Test the crawler gate
+
+`https://www.nytimes.com/robots.txt` disallows GPTBot:
+
+```
+User-agent: GPTBot
+Disallow: /
+```
+
+The public status for that bot is `block`. This repository's [`.github/workflows/crawler-gate.yml`](.github/workflows/crawler-gate.yml) runs the action in-tree (`uses: ./`) against that URL with `fail-below: 0` and `fail-on-crawler-block: true`. The action step sets `continue-on-error`. The job stays green only when that gate failure names GPTBot in the Check summary or the job log. A low score is not what the assertion accepts.
+
+The same inputs in a consumer workflow:
+
+```yaml
+name: Crawler gate (GPTBot disallowed)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  checks: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  crawler-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vinpatel/aeorank-action@v1
+        with:
+          url: https://www.nytimes.com
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail-below: 0
+          fail-on-crawler-block: true
+```
 
 ---
 
@@ -86,32 +128,51 @@ Replace `https://example.com` with the URL you want to scan on every push or pul
 
 **On every push and pull request:**
 
-The action runs `aeorank scan <url> --format json --no-files` using the AEOrank CLI. It then posts the result as a **GitHub Check Run** attached to the commit:
+The action runs `npx aeorank-cli@0.1.2 scan <url> --format json --no-files`. It then posts the result as a **GitHub Check Run** attached to the commit:
 
+- AI crawler table first (GPTBot, ClaudeBot, PerplexityBot, Google-Extended), each `allow`, `block`, or `unknown`
 - Score and grade shown in the Check summary
 - Full dimension breakdown table in the Check details
-- Check conclusion is `success`, `neutral`, or `failure` based on the score (see table below)
+- Check conclusion is `success`, `neutral`, or `failure` based on the score and the crawler gate (see table below)
+
+`aeorank-cli@0.1.2` scores **36** dimensions (`dimensionCount` and `dimensions.length`) and writes **8** files: `llms.txt`, `llms-full.txt`, `CLAUDE.md`, `schema.json`, `robots-patch.txt`, `faq-blocks.html`, `citation-anchors.html`, and `sitemap-ai.xml`. This Action passes `--no-files`, so it does not write them. `ai.txt` is scored when the site serves it and is not one of those generated files.
+
+`--fail-on-crawler-block` is also a CLI flag. The flag exits **2** when the gate fails. Scan errors stay **1**. The Action input does not pass the flag; it reads `crawlerGate` and still posts the Check.
 
 **On pull requests only:**
 
-Posts (or updates) a **PR comment** with the score and dimension table. The comment uses a hidden `<!-- aeorank-score -->` marker so re-runs update the existing comment rather than posting new ones. Your PR thread stays clean no matter how many times the workflow runs.
+Posts (or updates) a **PR comment** with the score, crawler table, and dimension table. The comment uses a hidden `<!-- aeorank-score -->` marker so re-runs update the existing comment rather than posting new ones. Your PR thread stays clean no matter how many times the workflow runs.
 
 **With `fail-below`:**
 
 Set `fail-below: 70` (or any threshold from 1–100) to make the Check fail whenever the AEO score drops below that number. This lets you enforce a minimum AEO quality bar in CI — PRs that drop the score below your threshold will show a failing Check.
 
+**With `fail-on-crawler-block` (default `true`):**
+
+The Check fails when the public status of GPTBot, ClaudeBot, PerplexityBot, or Google-Extended is **`block`** — even if the overall score is high. The Check summary names which bot is blocked. A missing `robots.txt` is **`unknown`** and does not fail.
+
+Set `fail-on-crawler-block: false` to keep the crawler table and skip this gate.
+
+The CLI JSON contract (`aeorank-cli@0.1.2`):
+
+- `crawlerAccess` emits **`allow`**, **`block`**, or **`unknown`** (for example `{ "GPTBot": "block" }`). That is the public status. `meta.robotsTxt.crawlerAccess` still uses the parser's internal **`allowed`** / **`disallowed`** / **`unknown`**.
+- The Check table maps `allowed` → `allow` and `disallowed` → `block`, and shows `allow` / `block` / `unknown` unchanged.
+- `crawlerGate.failed`: `true` only when a checked bot's public status is `block`
+- `crawlerGate.blockedBots`: names to put in the Check summary
+
 ---
 
 ## Check Conclusion Logic
 
-| Score Range | `fail-below` triggered? | Conclusion | Display |
-|-------------|------------------------|------------|---------|
-| 70–100 | No | `success` | Green check |
-| 40–69 | No | `neutral` | Grey dash |
-| 0–39 | No | `failure` | Red X |
-| Any | Yes (score < threshold) | `failure` | Red X |
+| Score Range | Crawler blocked? | `fail-below` triggered? | Conclusion | Display |
+|-------------|------------------|------------------------|------------|---------|
+| Any | Yes (`block`) | — | `failure` | Red X (bot named) |
+| 70–100 | No | No | `success` | Green check |
+| 40–69 | No | No | `neutral` | Grey dash |
+| 0–39 | No | No | `failure` | Red X |
+| Any | No | Yes (score < threshold) | `failure` | Red X |
 
-The `fail-below` input overrides the normal conclusion — if the score is below your threshold, the Check fails regardless of whether the score would otherwise be `neutral` or `success`.
+The `fail-below` input overrides the normal score bands. A crawler **`block`** overrides both. **`unknown`** (including a missing robots.txt) does not.
 
 ---
 
@@ -134,7 +195,7 @@ For most projects, the simplest approach is to skip Check/comment posting on for
 
 ## Caching (Optional)
 
-`npx aeorank@latest` downloads the CLI from npm on every run, adding 5–15 seconds. You can reduce this with npm caching:
+The Action installs `aeorank-cli@0.1.2` (package name `aeorank-cli`) from npm on a cold runner, adding 5–15 seconds. You can reduce this with npm caching:
 
 ```yaml
 jobs:
@@ -145,7 +206,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.npm
-          key: ${{ runner.os }}-npm-aeorank
+          key: ${{ runner.os }}-npm-aeorank-cli
           restore-keys: |
             ${{ runner.os }}-npm-
 
