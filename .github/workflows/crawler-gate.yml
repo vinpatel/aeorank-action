@@ -1,0 +1,33 @@
+# Example: exercise fail-on-crawler-block against a live robots.txt that
+# disallows GPTBot. https://www.nytimes.com/robots.txt includes:
+#
+#   User-agent: GPTBot
+#   Disallow: /
+#
+# The Check is expected to conclude failure and name GPTBot. Missing
+# robots.txt is unknown and would not fail this gate. fail-below is 0 so a
+# low score is not what fails the Check.
+name: Crawler gate (GPTBot disallowed)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  checks: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  crawler-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan a site that disallows GPTBot
+        uses: ./
+        with:
+          url: https://www.nytimes.com
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail-below: 0
+          fail-on-crawler-block: true

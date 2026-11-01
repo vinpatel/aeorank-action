@@ -24,6 +24,7 @@ Scan any URL for AI Engine Optimization (AEO) score and post results as a GitHub
 | `url` | URL to scan | Yes | — |
 | `token` | GitHub token for API calls | No | `${{ github.token }}` |
 | `fail-below` | Fail the Check if AEO score drops below this value (0 = never fail) | No | `0` |
+| `fail-on-crawler-block` | Fail the Check if GPTBot, ClaudeBot, PerplexityBot, or Google-Extended is `disallowed` in robots.txt (fail the PR if GPTBot is blocked). Missing robots.txt is `unknown`, not `disallowed`. | No | `true` |
 
 ---
 
@@ -76,9 +77,48 @@ jobs:
           url: https://example.com
           token: ${{ secrets.GITHUB_TOKEN }}
           fail-below: 70
+          fail-on-crawler-block: true
 ```
 
 Replace `https://example.com` with the URL you want to scan on every push or pull request.
+
+---
+
+## Test the crawler gate
+
+`https://www.nytimes.com/robots.txt` disallows GPTBot:
+
+```
+User-agent: GPTBot
+Disallow: /
+```
+
+This repository's [`.github/workflows/crawler-gate.yml`](.github/workflows/crawler-gate.yml) runs the action in-tree (`uses: ./`) against that URL with `fail-below: 0` and `fail-on-crawler-block: true`. The Check is expected to conclude `failure` and name GPTBot. A low score is not the reason it fails.
+
+The same inputs in a consumer workflow:
+
+```yaml
+name: Crawler gate (GPTBot disallowed)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  checks: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  crawler-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vinpatel/aeorank-action@v1
+        with:
+          url: https://www.nytimes.com
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail-below: 0
+          fail-on-crawler-block: true
+```
 
 ---
 
@@ -86,32 +126,47 @@ Replace `https://example.com` with the URL you want to scan on every push or pul
 
 **On every push and pull request:**
 
-The action runs `aeorank scan <url> --format json --no-files` using the AEOrank CLI. It then posts the result as a **GitHub Check Run** attached to the commit:
+The action runs `npx aeorank-cli@0.1.2 scan <url> --format json --no-files`. It then posts the result as a **GitHub Check Run** attached to the commit:
 
+- AI crawler table first (GPTBot, ClaudeBot, PerplexityBot, Google-Extended)
 - Score and grade shown in the Check summary
 - Full dimension breakdown table in the Check details
-- Check conclusion is `success`, `neutral`, or `failure` based on the score (see table below)
+- Check conclusion is `success`, `neutral`, or `failure` based on the score and the crawler gate (see table below)
 
 **On pull requests only:**
 
-Posts (or updates) a **PR comment** with the score and dimension table. The comment uses a hidden `<!-- aeorank-score -->` marker so re-runs update the existing comment rather than posting new ones. Your PR thread stays clean no matter how many times the workflow runs.
+Posts (or updates) a **PR comment** with the score, crawler table, and dimension table. The comment uses a hidden `<!-- aeorank-score -->` marker so re-runs update the existing comment rather than posting new ones. Your PR thread stays clean no matter how many times the workflow runs.
 
 **With `fail-below`:**
 
 Set `fail-below: 70` (or any threshold from 1–100) to make the Check fail whenever the AEO score drops below that number. This lets you enforce a minimum AEO quality bar in CI — PRs that drop the score below your threshold will show a failing Check.
 
+**With `fail-on-crawler-block` (default `true`):**
+
+The Check fails when GPTBot, ClaudeBot, PerplexityBot, or Google-Extended is **`disallowed`** in `robots.txt` — even if the overall score is high. The Check summary names which bot is blocked. A missing `robots.txt` is **`unknown`** and does not fail.
+
+Set `fail-on-crawler-block: false` to keep the crawler table and skip this gate.
+
+`aeorank-cli` JSON the action reads:
+
+- `crawlerAccess`: `{ "GPTBot": "allowed" | "disallowed" | "unknown", ... }`
+- `crawlerGate.failed`: `true` only when a checked bot is `disallowed`
+- `crawlerGate.blockedBots`: names to put in the Check summary
+- `aeorank-cli --fail-on-crawler-block` exits **2** (scan errors stay **1**). The action reads the JSON and still posts the Check; it does not rely on that exit code.
+
 ---
 
 ## Check Conclusion Logic
 
-| Score Range | `fail-below` triggered? | Conclusion | Display |
-|-------------|------------------------|------------|---------|
-| 70–100 | No | `success` | Green check |
-| 40–69 | No | `neutral` | Grey dash |
-| 0–39 | No | `failure` | Red X |
-| Any | Yes (score < threshold) | `failure` | Red X |
+| Score Range | Crawler status | `fail-below` triggered? | Conclusion | Display |
+|-------------|----------------|------------------------|------------|---------|
+| Any | a gate bot is `disallowed` | — | `failure` | Red X (bot named) |
+| 70–100 | none `disallowed` | No | `success` | Green check |
+| 40–69 | none `disallowed` | No | `neutral` | Grey dash |
+| 0–39 | none `disallowed` | No | `failure` | Red X |
+| Any | none `disallowed` | Yes (score < threshold) | `failure` | Red X |
 
-The `fail-below` input overrides the normal conclusion — if the score is below your threshold, the Check fails regardless of whether the score would otherwise be `neutral` or `success`.
+`fail-below` overrides the normal score bands. A `disallowed` gate bot overrides both. `unknown` (including a missing robots.txt) does not.
 
 ---
 
@@ -134,7 +189,7 @@ For most projects, the simplest approach is to skip Check/comment posting on for
 
 ## Caching (Optional)
 
-`npx aeorank@latest` downloads the CLI from npm on every run, adding 5–15 seconds. You can reduce this with npm caching:
+`npx aeorank-cli@0.1.2` downloads the CLI from npm on every run, adding 5–15 seconds. You can reduce this with npm caching:
 
 ```yaml
 jobs:
@@ -145,7 +200,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.npm
-          key: ${{ runner.os }}-npm-aeorank
+          key: ${{ runner.os }}-npm-aeorank-cli-0.1.2
           restore-keys: |
             ${{ runner.os }}-npm-
 
