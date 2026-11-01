@@ -93,7 +93,7 @@ User-agent: GPTBot
 Disallow: /
 ```
 
-This repository's [`.github/workflows/crawler-gate.yml`](.github/workflows/crawler-gate.yml) runs the action in-tree (`uses: ./`) against that URL with `fail-below: 0` and `fail-on-crawler-block: true`. The Check is expected to conclude `failure` and name GPTBot. A low score is not the reason it fails.
+This repository's [`.github/workflows/crawler-gate.yml`](.github/workflows/crawler-gate.yml) runs the action in-tree (`uses: ./`) against that URL with `fail-below: 0` and `fail-on-crawler-block: true`. The action step sets `continue-on-error`. The job stays green only when that gate failure names GPTBot in the Check summary or the job log. A low score is not what the assertion accepts.
 
 The same inputs in a consumer workflow:
 

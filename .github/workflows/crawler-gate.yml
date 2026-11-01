@@ -1,12 +1,15 @@
-# Example: exercise fail-on-crawler-block against a live robots.txt that
-# disallows GPTBot. https://www.nytimes.com/robots.txt includes:
+# Prove fail-on-crawler-block against a live robots.txt that disallows GPTBot.
+# https://www.nytimes.com/robots.txt includes:
 #
 #   User-agent: GPTBot
 #   Disallow: /
 #
-# The Check is expected to conclude failure and name GPTBot. Missing
-# robots.txt is unknown and would not fail this gate. fail-below is 0 so a
-# low score is not what fails the Check.
+# The action step is expected to record that gate failure (Check conclusion
+# failure, or a non-zero step outcome) and to name GPTBot in the Check
+# summary or job output. continue-on-error keeps that expected failure from
+# failing the job; the next step fails unless the failure happened and names
+# GPTBot. A correct gate leaves this job green. fail-below is 0 so a low
+# score is not what fails the gate.
 name: Crawler gate (GPTBot disallowed)
 
 on:
@@ -25,9 +28,109 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Scan a site that disallows GPTBot
+        id: gate
+        continue-on-error: true
         uses: ./
         with:
           url: https://www.nytimes.com
           token: ${{ secrets.GITHUB_TOKEN }}
           fail-below: 0
           fail-on-crawler-block: true
+
+      - name: Assert the gate failed and names GPTBot
+        if: always()
+        env:
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          echo "action step outcome: ${GATE_OUTCOME}"
+
+          # Check runs are queried with GET. -f would otherwise flip gh api to POST.
+          # Keep polling until the GPTBot failure check is visible. Another
+          # AEOrank Score check on this SHA must not end the wait early.
+          for attempt in 1 2 3 4 5; do
+            gh api --method GET \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
+              -f check_name="AEOrank Score" \
+              -f per_page=20 \
+              > /tmp/aeorank-checks.json
+            found="$(python3 -c 'import json; data=json.load(open("/tmp/aeorank-checks.json")); titles=[((r.get("output") or {}).get("title") or "") for r in (data.get("check_runs") or []) if r.get("conclusion")=="failure"]; print("yes" if any("GPTBot" in t and "blocked" in t.lower() for t in titles) else "no")')"
+            if [ "$found" = "yes" ] || [ "$GATE_OUTCOME" = "failure" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          python3 - << 'PY'
+          import json, os, pathlib, sys
+
+          outcome = os.environ.get("GATE_OUTCOME", "")
+          table = os.environ.get("AEORANK_TABLE", "")
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          step_summary = ""
+          if summary_path and os.path.exists(summary_path):
+              step_summary = pathlib.Path(summary_path).read_text()
+
+          raw = pathlib.Path("/tmp/aeorank-checks.json").read_text()
+          try:
+              payload = json.loads(raw) if raw.strip() else {}
+          except json.JSONDecodeError:
+              print("could not read check runs")
+              print(raw[:2000])
+              sys.exit(1)
+
+          runs = payload.get("check_runs") or []
+          check_blobs = []
+          for run in runs:
+              output = run.get("output") or {}
+              blob = "\n".join(
+                  part
+                  for part in (output.get("title"), output.get("summary"), output.get("text"))
+                  if part
+              )
+              check_blobs.append((run.get("conclusion") or "", blob))
+
+          evidence = "\n".join([table, step_summary, *(blob for _, blob in check_blobs)])
+
+          def names_gptbot_block(text: str) -> bool:
+              if "GPTBot blocked" in text or "GPTBot is blocked" in text:
+                  return True
+              if "**Blocked:**" in text:
+                  blocked_line = text.split("**Blocked:**", 1)[1].split("\n", 1)[0]
+                  if "GPTBot" in blocked_line:
+                      return True
+              for line in text.splitlines():
+                  if not line.strip().startswith("| GPTBot |"):
+                      continue
+                  cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                  if len(cells) >= 2 and cells[1] in {"block", "disallowed", "disallow"}:
+                      return True
+              return False
+
+          named = names_gptbot_block(evidence)
+          step_failed = outcome == "failure"
+          check_failed = any(
+              conclusion == "failure" and names_gptbot_block(blob)
+              for conclusion, blob in check_blobs
+          )
+
+          print("--- gate evidence ---")
+          print(evidence.strip() or "(empty)")
+          print("---")
+          print(f"step_failed={step_failed} check_failed={check_failed} names_gptbot={named}")
+
+          # The action posts the gate as a failed Check and leaves the composite
+          # step successful. continue-on-error also covers a real step failure
+          # (outcome == failure). Either one keeps this job green when GPTBot
+          # is named as blocked. A step failure that does not name GPTBot, or a
+          # scan that does not fail the gate, fails this job.
+          if named and (step_failed or check_failed):
+              print("crawler gate failed and named GPTBot")
+              sys.exit(0)
+
+          print("expected a crawler-gate failure whose log or summary names GPTBot")
+          sys.exit(1)
+          PY
